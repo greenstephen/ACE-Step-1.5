@@ -58,6 +58,39 @@ class TestLmInitializeCudaIndex(unittest.TestCase):
             backend = "pt"
         self.assertEqual(backend, "vllm")
 
+    @patch("acestep.llm_inference.set_active_cuda_device")
+    @patch("acestep.llm_inference.torch.cuda.is_available", return_value=True)
+    @patch("acestep.llm_inference.torch.cuda.get_device_name", return_value="FakeGPU")
+    def test_vllm_passes_mapped_cuda_device_to_nanovllm(
+        self, _mock_name, _mock_cuda, _mock_set_device
+    ):
+        """nano-vllm LLM() must receive cuda_device from mapped self.device."""
+        handler = LLMHandler()
+        handler.device = "cuda:3"
+        handler.llm_tokenizer = object()
+        handler.max_model_len = 4096
+        fake_runner = type("Runner", (), {"device_id": 3})()
+        fake_llm = type("LLM", (), {"model_runner": fake_runner})()
+
+        with (
+            patch("nanovllm.LLM", return_value=fake_llm) as mock_llm,
+            patch.object(handler, "get_gpu_memory_utilization", return_value=(0.5, False)),
+            patch.object(handler, "_cleanup_torch_distributed_state"),
+            patch("acestep.llm_inference.gc.collect"),
+            patch("acestep.llm_inference.torch.cuda.empty_cache"),
+        ):
+            status = handler._initialize_5hz_lm_vllm(
+                "/tmp/fake-lm",
+                enforce_eager=True,
+                has_triton=False,
+            )
+
+        self.assertTrue(status.startswith("✅"))
+        self.assertIn("cuda:3", status)
+        kwargs = mock_llm.call_args.kwargs
+        self.assertEqual(kwargs.get("cuda_device"), 3)
+        self.assertTrue(handler.llm_initialized)
+
 
 if __name__ == "__main__":
     unittest.main()

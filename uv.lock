@@ -118,7 +118,7 @@ requires-dist = [
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.25.2" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.20.0" },
     { name = "modelscope" },
-    { name = "nano-vllm", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'", directory = "acestep/third_parts/nano-vllm" },
+    { name = "nano-vllm", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'", editable = "acestep/third_parts/nano-vllm" },
     { name = "numba", specifier = ">=0.63.1" },
     { name = "peft", specifier = ">=0.18.0" },
     { name = "pytorch-wavelets", specifier = ">=1.3.0" },
@@ -1268,7 +1268,7 @@ wheels = [
 [[package]]
 name = "nano-vllm"
 version = "0.2.0"
-source = { directory = "acestep/third_parts/nano-vllm" }
+source = { editable = "acestep/third_parts/nano-vllm" }
 dependencies = [
     { name = "flash-attn", version = "2.8.2", source = { url = "https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.2/flash_attn-2.8.2+cu128torch2.7.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl" }, marker = "python_full_version < '3.12' and platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "flash-attn", version = "2.8.3+cu128torch2.10", source = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.8.3+cu128torch2.10-cp311-cp311-linux_x86_64.whl" }, marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },

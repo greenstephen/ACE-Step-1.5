@@ -840,8 +840,6 @@ class LLMHandler:
         try:
             if is_cuda_device(self.device):
                 set_active_cuda_device(self.device)
-            current_device = torch.cuda.current_device()
-            device_name = torch.cuda.get_device_name(current_device)
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -882,6 +880,28 @@ class LLMHandler:
 
             try:
                 start_time = time.time()
+                lm_cuda_index = (
+                    cuda_device_index(self.device)
+                    if is_cuda_device(self.device)
+                    else torch.cuda.current_device()
+                )
+                # Guard against stale non-editable nano-vllm installs that silently
+                # drop unknown kwargs and force set_device(rank) → GPU 0.
+                try:
+                    from dataclasses import fields as _dc_fields
+
+                    from nanovllm.config import Config as _NanoConfig
+
+                    if "cuda_device" not in {f.name for f in _dc_fields(_NanoConfig)}:
+                        logger.error(
+                            "Installed nano-vllm Config lacks cuda_device; mapped LM "
+                            f"device cuda:{lm_cuda_index} will be ignored and the model "
+                            "will load on GPU 0. Reinstall with: "
+                            "uv pip install -e ./acestep/third_parts/nano-vllm"
+                        )
+                except Exception as exc:
+                    logger.warning(f"Could not verify nano-vllm cuda_device support: {exc}")
+
                 self.llm = LLM(
                     model=model_path,
                     enforce_eager=enforce_eager,
@@ -889,11 +909,26 @@ class LLMHandler:
                     max_model_len=self.max_model_len,
                     gpu_memory_utilization=gpu_memory_utilization,
                     tokenizer=self.llm_tokenizer,
+                    cuda_device=lm_cuda_index,
                 )
-                logger.info(f"5Hz LM initialized successfully in {time.time() - start_time:.2f} seconds")
+                # Prefer the runner's device after load; fall back to the requested index.
+                runner_device_id = getattr(
+                    getattr(self.llm, "model_runner", None), "device_id", lm_cuda_index
+                )
+                device_name = torch.cuda.get_device_name(runner_device_id)
+                logger.info(
+                    f"5Hz LM initialized successfully in {time.time() - start_time:.2f} seconds "
+                    f"on cuda:{runner_device_id} ({device_name})"
+                )
                 self.llm_initialized = True
                 self.llm_backend = "vllm"
-                return f"✅ 5Hz LM initialized successfully\nModel: {model_path}\nDevice: {device_name}\nGPU Memory Utilization: {gpu_memory_utilization:.3f}\nLow GPU Memory Mode: {low_gpu_memory_mode}"
+                return (
+                    f"✅ 5Hz LM initialized successfully\n"
+                    f"Model: {model_path}\n"
+                    f"Device: cuda:{runner_device_id} ({device_name})\n"
+                    f"GPU Memory Utilization: {gpu_memory_utilization:.3f}\n"
+                    f"Low GPU Memory Mode: {low_gpu_memory_mode}"
+                )
             finally:
                 if _dynamo_state_saved:
                     _dynamo.config.suppress_errors = _prev_suppress

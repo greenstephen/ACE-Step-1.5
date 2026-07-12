@@ -1,0 +1,35 @@
+---
+description: Multi-GPU PR stack follow-up strategy; do not disturb open PRs; pending nano-vllm LM device fix
+alwaysApply: true
+---
+
+# Multi-GPU follow-up strategy (fork)
+
+Read `dev/MULTI_GPU_FOLLOWUP.md` before changing multi-GPU, device_map, GPU docs, Turing/dtype paths, or nano-vllm CUDA placement.
+
+## Do not disturb open PRs
+
+Keep the stacked multi-GPU PRs as-is until merged:
+
+1. PR1 `feat/multi-gpu-pr1-device-map` — ComponentDeviceMap ([#1262](https://github.com/ace-step/ACE-Step-1.5/pull/1262))
+2. PR2 `feat/multi-gpu-pr2-auto-layout` — auto layout + cross-GPU routing ([#1263](https://github.com/ace-step/ACE-Step-1.5/pull/1263))
+3. PR3 `feat/multi-gpu-pr3-cli-api` — CLI/API + `docs/en/MULTI_GPU.md` ([#1264](https://github.com/ace-step/ACE-Step-1.5/pull/1264))
+
+Do **not** open a new multi-GPU review PR while these are open. Do not fold low-VRAM docs, Turing dtype fixes, capability UI, or the nano-vllm LM placement fix into those reviews.
+
+## After merge — ordered follow-ups
+
+1. **nano-vllm honor mapped `cuda:N` (ready locally)** — branch `fix/nanovllm-honor-cuda-device`. See `dev/MULTI_GPU_FOLLOWUP.md` § Pending: nano-vllm LM on GPU 0. Open only after PR3 merges; rebase onto `main`.
+2. **Docs PR** — component placement ≠ pooled VRAM; `auto` vs explicit; 8 GB-class recipe.
+3. **Capability UI/CLI** — per-GPU fit / utilization (after docs language exists).
+4. **Turing/dtype PR** (optional separate) — honor `ACESTEP_DTYPE`; float16→INT8→float32 load on pre-Ampere 8 GB.
+
+## Hard facts from 2080 / 3090 testing
+
+- VRAM is per-card; largest **component** must fit on one GPU.
+- `auto` needs free VRAM ≥ DiT peak estimate (~7.53 GB for turbo); idle 2080 ~7.49 GB → auto **fails** and falls back to **single-GPU**, not an explicit multi-map.
+- Explicit `dit:0,vae:0,text_encoder:0,lm:1` works for turbo + 1.7B.
+- Default float16 DiT on Turing → NaN latents; smoke path used INT8 + float32 compute.
+- 4×3090 can run XL+4B with plain `uv run acestep` (single card fits); multi-GPU optional there.
+- CLI flag is `--gpu-mapping` (hyphen). Underscore `--gpu_mapping` is rejected by argparse.
+- Path dep `nano-vllm` must be **editable** (`pyproject.toml` / `uv.lock`) or `uv run` can install a stale copy that ignores `cuda_device`.

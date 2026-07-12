@@ -36,6 +36,16 @@ uv run python -m unittest acestep.training.test_lora_utils.TestUnwrapDecoder.tes
 uv run python -m unittest discover -s acestep/training -p "*_test.py"
 ```
 
+## Multi-GPU follow-ups
+
+Before changing multi-GPU / `device_map` / nano-vllm CUDA placement, read
+`dev/MULTI_GPU_FOLLOWUP.md` and `.cursor/rules/multi-gpu-followup-strategy.mdc`.
+
+- Do **not** disturb open stacked PRs #1262 / #1263 / #1264 until merged.
+- Pending validated fix on branch `fix/nanovllm-honor-cuda-device` (honor mapped
+  `cuda:N` for LM load + generate). **Do not open a review PR for it until PR3
+  merges**; then rebase onto `main` and open one focused PR.
+
 ## Scope and Change Control (Required)
 
 - Solve one problem per task/PR.

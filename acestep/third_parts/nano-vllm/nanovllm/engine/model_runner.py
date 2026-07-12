@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 import sys
 
 from nanovllm.config import Config
+from nanovllm.cuda_device import resolve_cuda_device_id, to_runner_cuda_device
 from acestep.debug_utils import debug_start, debug_end
 from nanovllm import distributed as dist_utils
 
@@ -127,13 +128,17 @@ class ModelRunner:
             # Use gloo backend on Windows, nccl on Linux/other platforms
             backend = "gloo" if sys.platform == "win32" else "nccl"
             dist_utils.initialize_distributed(backend, f"tcp://127.0.0.1:{dist_port}", world_size=self.world_size, rank=rank)
-        
-        torch.cuda.set_device(rank)
+
+        # TP rank is not a physical GPU id. Honor config.cuda_device so LM can
+        # load on a mapped cuda:N (e.g. ACE-Step --gpu_mapping lm:3).
+        device_id = resolve_cuda_device_id(config.cuda_device, rank)
+        self.device_id = device_id
+        torch.cuda.set_device(device_id)
         default_dtype = torch.get_default_dtype()
         
         # Detect GPU compute capability to determine bfloat16 support
         # Bfloat16 requires Ampere (compute capability >= 8.0) or newer
-        gpu_props = torch.cuda.get_device_properties(rank)
+        gpu_props = torch.cuda.get_device_properties(device_id)
         # Use tuple comparison to handle compute capability correctly
         # (e.g., 7.5 < 8.0, 8.0 >= 8.0, 8.6 >= 8.0, etc.)
         supports_bfloat16 = (gpu_props.major, gpu_props.minor) >= (8, 0)
@@ -196,6 +201,10 @@ class ModelRunner:
                 dist_utils.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+
+    def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Copy *tensor* onto this runner's mapped CUDA device (not current_device)."""
+        return to_runner_cuda_device(tensor, self.device_id)
 
     def _allocate_sample_buffers(self):
         """Pre-allocate reusable buffers for sampling to avoid repeated tensor creation."""
@@ -353,7 +362,15 @@ class ModelRunner:
             f"target: {target_total_usage / 1024**3:.2f} GB, block: {block_bytes / 1024**2:.2f} MB, "
             f"post_kv_free: {post_kv_free:.2f} GB)"
         )
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(
+            2,
+            hf_config.num_hidden_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+            device=self.device_id,
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -366,7 +383,7 @@ class ModelRunner:
         _t0 = debug_start("prepare_block_tables", prefix="tensor.vllm")
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self._to_device(torch.tensor(block_tables, dtype=torch.int32, pin_memory=True))
         debug_end("prepare_block_tables", _t0, prefix="tensor.vllm")
         return block_tables
 
@@ -401,11 +418,11 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        input_ids = self._to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
+        positions = self._to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
+        cu_seqlens_q = self._to_device(torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True))
+        cu_seqlens_k = self._to_device(torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True))
+        slot_mapping = self._to_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True))
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         debug_end("prepare_prefill", _t0, prefix="tensor.vllm")
         return input_ids, positions
@@ -423,10 +440,10 @@ class ModelRunner:
             self._cpu_slot_mapping[i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
         
         # Transfer to GPU using sliced views
-        input_ids = self._cpu_input_ids[:bs].cuda(non_blocking=True)
-        positions = self._cpu_positions[:bs].cuda(non_blocking=True)
-        slot_mapping = self._cpu_slot_mapping[:bs].cuda(non_blocking=True)
-        context_lens = self._cpu_context_lens[:bs].cuda(non_blocking=True)
+        input_ids = self._to_device(self._cpu_input_ids[:bs])
+        positions = self._to_device(self._cpu_positions[:bs])
+        slot_mapping = self._to_device(self._cpu_slot_mapping[:bs])
+        context_lens = self._to_device(self._cpu_context_lens[:bs])
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         debug_end("prepare_decode", _t0, prefix="tensor.vllm")
@@ -460,11 +477,11 @@ class ModelRunner:
                 repetition_penalties_is_one = False
         
         # Transfer to GPU using sliced views (single batched transfer)
-        temperatures = self._cpu_temperatures[:num_seqs].cuda(non_blocking=True)
-        cfg_scales = self._cpu_cfg_scales[:num_seqs].cuda(non_blocking=True)
-        top_ks = self._cpu_top_ks[:num_seqs].cuda(non_blocking=True) if not top_ks_is_zero else None
-        top_ps = self._cpu_top_ps[:num_seqs].cuda(non_blocking=True) if not top_ps_is_one else None
-        repetition_penalties = self._cpu_repetition_penalties[:num_seqs].cuda(non_blocking=True) if not repetition_penalties_is_one else None
+        temperatures = self._to_device(self._cpu_temperatures[:num_seqs])
+        cfg_scales = self._to_device(self._cpu_cfg_scales[:num_seqs])
+        top_ks = self._to_device(self._cpu_top_ks[:num_seqs]) if not top_ks_is_zero else None
+        top_ps = self._to_device(self._cpu_top_ps[:num_seqs]) if not top_ps_is_one else None
+        repetition_penalties = self._to_device(self._cpu_repetition_penalties[:num_seqs]) if not repetition_penalties_is_one else None
         
         debug_end("prepare_sample", _t0, prefix="tensor.vllm")
         return temperatures, cfg_scales, top_ks, top_ps, repetition_penalties
@@ -547,7 +564,9 @@ class ModelRunner:
         """Run model forward and sampling. For CFG sequences, batch is structured as:
         [cond_seq1, cond_seq2, ..., uncond_seq1, uncond_seq2, ...]
         where uncond_seqi is the paired unconditional sequence of cond_seqi."""
-        _debug_log(f"run: num_seqs={len(seqs)}, is_prefill={is_prefill}")
+        # Restore the mapped LM device: DiT/VAE may have changed current_device.
+        torch.cuda.set_device(self.device_id)
+        _debug_log(f"run: num_seqs={len(seqs)}, is_prefill={is_prefill}, device={self.device_id}")
         for i, seq in enumerate(seqs):
             _debug_log(f"  seq[{i}]: len={len(seq)}, num_blocks={seq.num_blocks}, "
                       f"cfg_scale={seq.cfg_scale}, is_uncond={seq.is_unconditional}, "
@@ -712,12 +731,12 @@ class ModelRunner:
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        input_ids = torch.zeros(max_bs, dtype=torch.int64, device=self.device_id)
+        positions = torch.zeros(max_bs, dtype=torch.int64, device=self.device_id)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=self.device_id)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=self.device_id)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=self.device_id)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size, device=self.device_id)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None

@@ -79,7 +79,9 @@ required-environments = [
 ]
 
 [tool.uv.sources]
-nano-vllm = { path = "acestep/third_parts/nano-vllm" }
+# Editable so local nano-vllm fixes (e.g. cuda_device placement) are picked up by
+# `uv run` instead of a stale non-editable site-packages copy.
+nano-vllm = { path = "acestep/third_parts/nano-vllm", editable = true }
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
